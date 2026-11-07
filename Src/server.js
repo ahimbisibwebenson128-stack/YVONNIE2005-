@@ -4,24 +4,21 @@ const express = require("express");
 const pino = require("pino");
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason
+  useMultiFileAuthState
 } = require("@whiskeysockets/baileys");
+
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_TOKEN = process.env.API_TOKEN;
-
-const sessions = new Map();
+const TOKEN = process.env.API_TOKEN;
+const accounts = new Map();
 
 app.get("/", (req, res) => {
-  res.json({
-    name: "YVONNIE2005",
-    status: "online",
-    message: "WhatsApp worker is running"
-  });
+  res.json({ name: "YVONNIE2005", status: "running" });
 });
 
 app.get("/health", (req, res) => {
@@ -29,89 +26,113 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/api", (req, res, next) => {
-  if (!API_TOKEN || req.headers.authorization !== `Bearer ${API_TOKEN}`) {
+  if (!TOKEN || req.headers.authorization !== `Bearer ${TOKEN}`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 });
 
-app.get("/api/accounts", (req, res) => {
-  res.json({
-    accounts: [...sessions.entries()].map(([id, socket]) => ({
-      id,
-      connected: socket.user ? true : false
-    }))
-  });
-});
-
 app.post("/api/accounts/:id/connect", async (req, res) => {
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g, "");
+
   if (!id) return res.status(400).json({ error: "Invalid account ID" });
+  if (accounts.has(id)) {
+    return res.json({ success: true, message: "Already started" });
+  }
 
   try {
-    const auth = await useMultiFileAuthState(`./sessions/${id}`);
+    const folder = path.join("/tmp", "yvonnie2005", id);
+    fs.mkdirSync(folder, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(folder);
 
     const socket = makeWASocket({
-      auth: auth.state,
-      logger: pino({ level: "silent" }),
-      printQRInTerminal: false
+      auth: state,
+      logger: pino({ level: "silent" })
     });
 
-    socket.ev.on("creds.update", auth.saveCreds);
+    const account = {
+      socket,
+      qr: null,
+      pairingCode: null,
+      status: "connecting"
+    };
+
+    accounts.set(id, account);
+
+    socket.ev.on("creds.update", saveCreds);
 
     socket.ev.on("connection.update", update => {
-      const { connection, lastDisconnect, qr } = update;
+      if (update.qr) account.qr = update.qr;
 
-      if (qr) console.log(`QR for ${id}: ${qr}`);
-
-      if (connection === "open") {
-        console.log(`${id} connected`);
+      if (update.connection === "open") {
+        account.status = "connected";
+        account.qr = null;
       }
 
-      if (connection === "close") {
-        sessions.delete(id);
-        const statusCode =
-          lastDisconnect?.error?.output?.statusCode;
-
-        if (statusCode !== DisconnectReason.loggedOut) {
-          console.log(`${id} disconnected; reconnect manually`);
-        }
+      if (update.connection === "close") {
+        account.status = "disconnected";
+        accounts.delete(id);
       }
     });
-
-    sessions.set(id, socket);
 
     res.json({
       success: true,
       account: id,
-      message: "Connection started. Pairing output is in service logs."
+      message: "Connection started"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post("/api/accounts/:id/send", async (req, res) => {
-  const socket = sessions.get(req.params.id);
-  const { number, message } = req.body || {};
+app.get("/api/accounts/:id/qr", (req, res) => {
+  const account = accounts.get(req.params.id);
 
-  if (!socket || !socket.user) {
-    return res.status(409).json({ error: "Account not connected" });
+  if (!account) {
+    return res.status(404).json({ error: "Start the connection first" });
   }
 
-  if (!number || !message) {
-    return res.status(400).json({ error: "Number and message required" });
+  res.json({
+    status: account.status,
+    qr: account.qr
+  });
+});
+
+app.post("/api/accounts/:id/pair-code", async (req, res) => {
+  const account = accounts.get(req.params.id);
+  const phone = String(req.body.phone || "").replace(/\D/g, "");
+
+  if (!account) {
+    return res.status(404).json({ error: "Start the connection first" });
+  }
+
+  if (!phone) {
+    return res.status(400).json({ error: "Phone number required" });
   }
 
   try {
-    const jid = number.replace(/\D/g, "") + "@s.whatsapp.net";
-    await socket.sendMessage(jid, { text: String(message) });
-    res.json({ success: true });
+    const code = await account.socket.requestPairingCode(phone);
+    account.pairingCode = code;
+
+    res.json({
+      success: true,
+      pairingCode: code
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+app.get("/api/accounts", (req, res) => {
+  res.json({
+    accounts: [...accounts.entries()].map(([id, account]) => ({
+      id,
+      status: account.status
+    }))
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`YVONNIE2005 worker listening on ${PORT}`);
+  console.log(`YVONNIE2005 running on port ${PORT}`);
 });
