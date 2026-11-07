@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: yvonnie2005-worker
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_TOKEN
+        generateValue: true
