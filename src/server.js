@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -6,7 +5,6 @@ const pino = require("pino");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
 const baileys = require("@whiskeysockets/baileys");
-
 const makeWASocket = baileys.default;
 const DisconnectReason = baileys.DisconnectReason || {};
 const { usePostgresAuthState } = require("./auth-state");
@@ -14,24 +12,21 @@ const { initializeDatabase, query } = require("./db");
 const { attachGroupHandlers } = require("./group");
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.API_TOKEN;
-const OWNER = process.env.OWNER_NAME || "YVONNIE2005";
-
 const accounts = new Map();
 const sessions = new Map();
 const ipAttempts = new Map();
-
 const SESSION_TTL = 15 * 60 * 1000;
 const MAX_SESSIONS = 25;
 const MAX_ATTEMPTS = 12;
 
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string") return false;
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
+  const x = Buffer.from(a), y = Buffer.from(b);
   return x.length === y.length && crypto.timingSafeEqual(x, y);
 }
 
@@ -46,7 +41,6 @@ function apiAuth(req, res, next) {
 function sessionAuth(req, res, next) {
   const session = sessions.get(req.params.id);
   const token = String(req.headers["x-session-token"] || "");
-
   if (!session || session.expiresAt < Date.now()) {
     return res.status(404).json({ error: "Session expired. Start a new session." });
   }
@@ -57,91 +51,58 @@ function sessionAuth(req, res, next) {
 }
 
 function rateLimit(req, res, next) {
-  const ip = String(
-    req.headers["x-forwarded-for"] ||
-    req.socket.remoteAddress ||
-    "unknown"
-  ).split(",")[0].trim();
-
+  const ip = String(req.ip || req.socket.remoteAddress || "unknown");
   const now = Date.now();
-  const attempts = (ipAttempts.get(ip) || [])
-    .filter(time => now - time < 60 * 60 * 1000);
-
+  const attempts = (ipAttempts.get(ip) || []).filter(t => now - t < 60 * 60 * 1000);
   if (attempts.length >= MAX_ATTEMPTS) {
-    return res.status(429).json({
-      error: "Too many attempts. Please wait before trying again."
-    });
+    return res.status(429).json({ error: "Too many attempts. Please wait before trying again." });
   }
-
   attempts.push(now);
   ipAttempts.set(ip, attempts);
   next();
 }
 
-/*
- * Wait for Baileys to initialize before requesting a pairing code.
- * This prevents requests being sent to a socket that is not ready.
- */
-function waitForSocketReady(account, timeoutMs = 15000) {
-  if (account.socketReady && account.status !== "disconnected" &&
-      account.status !== "logged_out") {
+function waitForSocketReady(account, timeoutMs = 20000) {
+  if (account.socketReady && !["disconnected", "logged_out"].includes(account.status)) {
     return Promise.resolve();
   }
-
-  if (!account.socket) {
-    return Promise.reject(new Error("WhatsApp socket is unavailable."));
-  }
-
+  if (!account.socket) return Promise.reject(new Error("WhatsApp socket is unavailable."));
   return new Promise((resolve, reject) => {
     const socket = account.socket;
-
+    let settled = false;
     const cleanup = () => {
       clearTimeout(timer);
       socket.ev.removeListener("connection.update", listener);
     };
-
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
     const listener = update => {
-      if (update.connection === "connecting" || update.qr ||
-          update.connection === "open") {
+      if (update.qr || update.connection === "open") {
         account.socketReady = true;
-        cleanup();
-        resolve();
-      }
-
-      if (update.connection === "close") {
-        cleanup();
-        reject(new Error("WhatsApp connection closed before initialization."));
+        finish(resolve);
+      } else if (update.connection === "close") {
+        finish(reject, new Error("WhatsApp connection closed before initialization."));
       }
     };
-
     const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("WhatsApp is taking too long to initialize. Start a new session."));
+      finish(reject, new Error("WhatsApp is taking too long to initialize. Start a new session."));
     }, timeoutMs);
-
     socket.ev.on("connection.update", listener);
   });
 }
 
 async function startAccount(id) {
   if (accounts.has(id)) return accounts.get(id);
-
   const { state, saveCreds } = await usePostgresAuthState(id);
-
   const account = {
-    id,
-    socket: null,
-    qr: null,
-    status: "connecting",
-    lastError: null,
-    pairingCode: null,
-    pairingPromise: null,
-    socketReady: false,
-    intentionalClose: false
+    id, socket: null, qr: null, status: "connecting", lastError: null,
+    pairingCode: null, pairingPromise: null, socketReady: false, intentionalClose: false
   };
-
   accounts.set(id, account);
-
   try {
     const socket = makeWASocket({
       auth: state,
@@ -154,9 +115,7 @@ async function startAccount(id) {
       markOnlineOnConnect: false,
       syncFullHistory: false
     });
-
     account.socket = socket;
-
     socket.ev.on("creds.update", async () => {
       try {
         await saveCreds();
@@ -165,56 +124,40 @@ async function startAccount(id) {
         account.lastError = "Could not save WhatsApp credentials.";
       }
     });
-
     attachGroupHandlers(socket);
-
     socket.ev.on("connection.update", update => {
-      if (update.connection === "connecting" || update.qr ||
-          update.connection === "open") {
-        account.socketReady = true;
-      }
-
       if (update.qr) {
         account.qr = update.qr;
         account.status = "qr";
+        account.socketReady = true;
         account.lastError = null;
       }
-
-      if (update.connection === "connecting") {
-        account.status = "connecting";
-      }
-
+      if (update.connection === "connecting") account.status = "connecting";
       if (update.connection === "open") {
         account.status = "connected";
         account.qr = null;
+        account.socketReady = true;
         account.lastError = null;
         account.pairingCode = null;
         account.pairingPromise = null;
         console.log("WhatsApp connected:", id);
-
         const session = sessions.get(id);
         if (session) session.connected = true;
       }
-
       if (update.connection === "close") {
         account.qr = null;
         account.socketReady = false;
-
         const statusCode = update.lastDisconnect?.error?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
-
         account.status = loggedOut ? "logged_out" : "disconnected";
         account.lastError = loggedOut
           ? "WhatsApp logged out. Reconnect your account."
           : "WhatsApp connection closed. Start a new session if needed.";
-
         account.pairingCode = null;
         account.pairingPromise = null;
-
         console.log("WhatsApp connection closed:", id, statusCode || "unknown");
       }
     });
-
     return account;
   } catch (error) {
     accounts.delete(id);
@@ -225,14 +168,11 @@ async function startAccount(id) {
 function endSession(id) {
   const session = sessions.get(id);
   if (!session) return;
-
   const account = accounts.get(id);
-
   if (account && account.status === "connected") {
     sessions.delete(id);
     return;
   }
-
   if (account?.socket) {
     account.intentionalClose = true;
     try {
@@ -240,405 +180,278 @@ function endSession(id) {
     } catch (_) {}
     accounts.delete(id);
   }
-
   sessions.delete(id);
 }
 
 async function createPublicSession() {
-  if (sessions.size >= MAX_SESSIONS) {
-    throw new Error("Portal is busy. Please try again shortly.");
-  }
-
+  if (sessions.size >= MAX_SESSIONS) throw new Error("Portal is busy. Please try again shortly.");
   const id = crypto.randomUUID();
   const token = crypto.randomBytes(32).toString("hex");
-
   sessions.set(id, {
     token,
     createdAt: Date.now(),
     expiresAt: Date.now() + SESSION_TTL,
     connected: false
   });
-
   try {
     await startAccount(id);
   } catch (error) {
     sessions.delete(id);
     throw error;
   }
-
   const timer = setTimeout(() => endSession(id), SESSION_TTL);
   if (timer.unref) timer.unref();
-
   return { id, token };
 }
 
-/* PUBLIC LANDING PAGE */
+/* Built-in YVONNIE2005 robot illustration */
+const robot = `<svg viewBox="0 0 240 240" role="img" aria-label="YVONNIE2005 robot mascot">
+<defs>
+<linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+<stop stop-color="#b8ffd0"/><stop offset="1" stop-color="#37b978"/>
+</linearGradient>
+<linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
+<stop stop-color="#fff0a8"/><stop offset="1" stop-color="#c99635"/>
+</linearGradient>
+<filter id="shadow"><feGaussianBlur stdDeviation="5"/></filter>
+</defs>
+<ellipse cx="120" cy="210" rx="70" ry="13" fill="#000" opacity=".35" filter="url(#shadow)"/>
+<path d="M79 51 64 19l34 18M161 51l15-32-34 18" fill="url(#gold)" stroke="#ffe7a0" stroke-width="5" stroke-linejoin="round"/>
+<path d="M120 8 130 27 151 30 136 45 140 66 120 56 100 66 104 45 89 30 110 27Z" fill="url(#gold)" stroke="#ffe7a0" stroke-width="3"/>
+<rect x="42" y="57" width="156" height="119" rx="38" fill="url(#g)" stroke="#d6ffe2" stroke-width="5"/>
+<rect x="57" y="75" width="126" height="83" rx="25" fill="#0b2118" stroke="#6ce4a0" stroke-width="3"/>
+<ellipse cx="91" cy="111" rx="10" ry="14" fill="#a9ffd0"/>
+<ellipse cx="149" cy="111" rx="10" ry="14" fill="#a9ffd0"/>
+<path d="M94 137q26 19 52 0" fill="none" stroke="#a9ffd0" stroke-width="5" stroke-linecap="round"/>
+<path d="M42 102H22v42h22M198 102h20v42h-22" fill="none" stroke="url(#gold)" stroke-width="9" stroke-linecap="round"/>
+<rect x="82" y="178" width="76" height="25" rx="12" fill="url(#gold)"/>
+<text x="120" y="195" text-anchor="middle" font-size="10" font-weight="900" fill="#182719">YVONNIE</text>
+</svg>`;
 
-app.get("/", (_req, res) => {
-  res.type("html").send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#07130f">
-<title>YVONNIE2005 | WhatsApp Automation</title>
-<style>
-:root{--bg:#06110d;--green:#9af0b5;--muted:#a9c4b2;--line:#28543b}
+const css = `
+:root{color-scheme:dark;--bg:#050d0a;--panel:rgba(14,35,25,.78);--line:rgba(151,241,184,.2);--green:#a8f5c2;--mint:#54d995;--gold:#e6c16d;--muted:#b4c9bb;--white:#f4fff7}
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{margin:0;background:radial-gradient(ellipse at 50% -10%,#1c5838 0%,var(--bg) 55%);color:#f2fff6;font-family:Inter,Arial,sans-serif}
-a{color:inherit;text-decoration:none}
-nav{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;padding:17px 6%;background:#06110de8;backdrop-filter:blur(14px);border-bottom:1px solid #214532}
-.logo{font-weight:900;letter-spacing:1px;color:var(--green)}
-.links{display:flex;gap:20px;align-items:center;font-size:14px;color:var(--muted)}
-.btn{display:inline-block;padding:13px 20px;border-radius:12px;background:var(--green);color:#092014;font-weight:800;border:0}
-.btn.secondary{background:#173c29;color:white;border:1px solid #3a7650}
-.hero{min-height:76vh;display:grid;place-items:center;text-align:center;padding:75px 20px}
-.hero-inner{max-width:850px}
-.tag{display:inline-block;padding:9px 14px;border:1px solid #397c50;border-radius:30px;color:var(--green);background:#10291d}
-h1{font-size:clamp(42px,8vw,78px);line-height:1.03;margin:24px 0}
-h1 span{color:var(--green)}
-p{color:var(--muted);line-height:1.7}
-.hero p{font-size:18px;max-width:680px;margin:0 auto 28px}
-.actions{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-section{padding:65px 7%;max-width:1250px;margin:auto}
-.section-title{text-align:center;margin-bottom:35px}
-.section-title h2{font-size:34px;margin:0 0 10px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:17px}
-.card{padding:24px;border-radius:18px;background:linear-gradient(145deg,#132d20,#0b1c13);border:1px solid var(--line)}
-.card .symbol{font-size:28px}
-.card h3{color:var(--green)}
-.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:15px}
-.step{padding:22px;border-left:3px solid var(--green);background:#10251c;border-radius:12px}
-.step b{font-size:22px;color:var(--green)}
-.cta{text-align:center;border:1px solid var(--line);background:#10251c;border-radius:25px;padding:45px 20px}
-footer{text-align:center;padding:35px;color:#91ad9a;border-top:1px solid #1c3828}
-@media(max-width:650px){.links a:not(.btn){display:none}.hero{min-height:70vh}section{padding:48px 6%}}
-</style>
-</head>
-<body>
-<nav>
-<a class="logo" href="/">YVONNIE2005</a>
-<div class="links">
-<a href="#features">Features</a><a href="/faq">FAQ & Guide</a>
-<a href="/admin">Admin</a><a class="btn" href="/connect">Connect WhatsApp</a>
-</div>
-</nav>
-<header class="hero"><div class="hero-inner">
-<div class="tag">● MULTI-DEVICE WHATSAPP BOT</div>
-<h1>Smarter WhatsApp.<br><span>More possibilities.</span></h1>
-<p>YVONNIE2005 is a WhatsApp automation platform with group assistance, AI conversations, administration tools and a simple account connection portal.</p>
-<div class="actions">
-<a class="btn" href="/connect">Connect your WhatsApp →</a>
-<a class="btn secondary" href="/faq">Read setup guide</a>
-</div></div></header>
-<section id="features">
-<div class="section-title"><h2>Powerful bot capabilities</h2><p>A growing collection of tools for everyday WhatsApp communities.</p></div>
-<div class="grid">
-<div class="card"><div class="symbol">🤖</div><h3>AI Assistant</h3><p>Ask questions and receive help with writing, learning and everyday tasks.</p></div>
-<div class="card"><div class="symbol">👥</div><h3>Group Tools</h3><p>Group information, rules and administration utilities.</p></div>
-<div class="card"><div class="symbol">🛡️</div><h3>Administration</h3><p>Permission-aware group management and moderation tools.</p></div>
-<div class="card"><div class="symbol">🎵</div><h3>Media Features</h3><p>Media commands may require additional external service integrations.</p></div>
-<div class="card"><div class="symbol">⚡</div><h3>Multi-device</h3><p>Connect using a QR code or WhatsApp phone-number pairing.</p></div>
-<div class="card"><div class="symbol">📊</div><h3>Control Centre</h3><p>Protected administrator tools for monitoring service and account status.</p></div>
-</div></section>
-<section>
-<div class="section-title"><h2>Connect in a few steps</h2><p>Use an account you own or are authorized to connect.</p></div>
-<div class="steps">
-<div class="step"><b>01</b><h3>Open the portal</h3><p>Choose QR code or phone-number pairing.</p></div>
-<div class="step"><b>02</b><h3>Link WhatsApp</h3><p>Follow the instructions shown on the connection page.</p></div>
-<div class="step"><b>03</b><h3>Start using the bot</h3><p>Once connected, use the available bot commands.</p></div>
-</div></section>
-<section><div class="cta">
-<h2>Ready to connect?</h2><p>Open the secure connection portal and follow the setup guide.</p>
-<a class="btn" href="/connect">Open connection portal</a>
-<a class="btn secondary" href="/faq">View FAQ</a>
-</div></section>
-<footer>© ${new Date().getFullYear()} YVONNIE2005 · WhatsApp automation platform</footer>
-</body></html>`);
+body{margin:0;background:radial-gradient(ellipse at 50% -15%,#245b3c 0%,#0b1b12 34%,var(--bg) 75%);color:var(--white);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Arial,sans-serif}
+a{color:var(--green);text-decoration:none}
+a:hover{color:#fff}
+button,input{font:inherit}
+.nav{position:sticky;top:0;z-index:10;display:flex;justify-content:space-between;align-items:center;gap:15px;padding:13px clamp(16px,5vw,65px);background:rgba(4,13,9,.82);backdrop-filter:blur(20px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:11px;font-weight:950;letter-spacing:1.4px;color:var(--green)}
+.brandmark{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:14px;background:#143321}
+.brandmark svg{width:35px}
+.navlinks{display:flex;align-items:center;gap:20px;color:var(--muted);font-size:13px}
+.wrap{width:min(1160px,92%);margin:auto}
+.btn{display:inline-flex;justify-content:center;align-items:center;gap:9px;padding:13px 19px;border:1px solid transparent;border-radius:13px;background:linear-gradient(135deg,#baffd0,#61d994);color:#082014;font-weight:850;box-shadow:0 10px 30px #4ad78a24;cursor:pointer}
+.btn:hover{transform:translateY(-1px);color:#06140c}
+.btn.alt{background:rgba(255,255,255,.05);border-color:var(--line);color:var(--white);box-shadow:none}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border:1px solid var(--line);border-radius:50px;background:#10281b;color:var(--green);font-size:11px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase}
+.hero{display:grid;grid-template-columns:1.15fr .85fr;align-items:center;gap:35px;padding:76px 0 68px;min-height:560px}
+.hero h1{font-size:clamp(42px,7vw,76px);line-height:1.02;letter-spacing:-2.8px;margin:20px 0}
+.gradient{background:linear-gradient(90deg,#c9ffda,#5edc9c,#e8d18d);background-clip:text;color:transparent}
+.lead{font-size:17px;line-height:1.8;color:var(--muted);max-width:660px}
+.actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:26px}
+.mascotbox{position:relative;min-height:350px;display:grid;place-items:center;border:1px solid var(--line);border-radius:34px;background:radial-gradient(circle at 50% 42%,#235b3c99,transparent 58%),linear-gradient(145deg,#193c29a8,#0a1710b8);box-shadow:inset 0 1px #ffffff12,0 25px 80px #0006;overflow:hidden}
+.mascotbox:before,.mascotbox:after{content:"";position:absolute;width:240px;height:240px;border:1px solid #9af0b52b;border-radius:50%}
+.mascotbox:after{width:300px;height:300px}
+.mascotbox svg{width:min(78%,300px);position:relative;z-index:1;filter:drop-shadow(0 18px 30px #0008)}
+.floatlabel{position:absolute;z-index:2;padding:10px 13px;border:1px solid var(--line);border-radius:13px;background:#07150fe8;color:var(--green);font-size:11px;font-weight:800;backdrop-filter:blur(10px)}
+.floatlabel.one{top:23px;left:18px}
+.floatlabel.two{right:18px;bottom:25px}
+.section{padding:66px 0}
+.sectionhead{text-align:center;max-width:720px;margin:0 auto 32px}
+.sectionhead h2{font-size:clamp(28px,4vw,43px);margin:12px 0}
+.sectionhead p{color:var(--muted);line-height:1.7}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.card{padding:23px;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,rgba(24,55,37,.8),rgba(9,23,15,.86));box-shadow:inset 0 1px #ffffff0b}
+.card .ico{width:48px;height:48px;display:grid;place-items:center;border-radius:15px;background:#b3ffd21a;border:1px solid var(--line);font-size:23px}
+.card h3{color:var(--green);margin:17px 0 8px}
+.card p{color:var(--muted);line-height:1.7;font-size:14px;margin:0}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:15px}
+.step{padding:22px;border-left:2px solid var(--gold);border-radius:0 17px 17px 0;background:#ffffff08}
+.step b{font-size:28px;color:var(--gold)}
+.step h3{margin:10px 0}
+.step p{color:var(--muted);line-height:1.65;font-size:14px}
+.banner{padding:36px;text-align:center;border:1px solid var(--line);border-radius:25px;background:radial-gradient(circle at top,#25583a88,transparent 65%),#102419}
+.banner h2{font-size:32px;margin:0 0 10px}
+.banner p{color:var(--muted)}
+.footer{padding:30px 0;text-align:center;color:#88a795;border-top:1px solid var(--line);font-size:12px}
+.portal{width:min(1120px,94%);margin:34px auto 60px}
+.portalhead{text-align:center;padding:25px 0 30px}
+.portalhead .mascotmini{width:96px;height:96px;margin:auto auto 12px;display:grid;place-items:center;border:1px solid var(--line);border-radius:28px;background:#153523}
+.mascotmini svg{width:88px}
+.portalhead h1{font-size:clamp(32px,5vw,49px);margin:12px 0}
+.portalhead p{color:var(--muted);line-height:1.7}
+.portalgrid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(270px,.9fr);gap:18px;align-items:start}
+.glass{padding:25px;border:1px solid var(--line);border-radius:23px;background:var(--panel);backdrop-filter:blur(18px);box-shadow:0 22px 60px #0005}
+.tabs{display:flex;gap:8px;padding:6px;border:1px solid var(--line);border-radius:14px;background:#06120c}
+.tabs button{flex:1;padding:12px 8px;border:0;border-radius:10px;background:transparent;color:var(--muted);font-weight:850;cursor:pointer}
+.tabs button.active{background:linear-gradient(135deg,#baffd0,#61d994);color:#082014}
+.panel{display:none}
+.panel.active{display:block}
+.panel h2{margin:22px 0 7px}
+.muted{color:var(--muted);line-height:1.7}
+.field{width:100%;padding:15px 16px;margin:12px 0;border:1px solid #47765a;border-radius:12px;background:#06140c;color:#fff;outline:none}
+.field:focus{border-color:var(--green);box-shadow:0 0 0 3px #a8f5c21b}
+.result{margin-top:17px;text-align:center;overflow-wrap:anywhere}
+.qrimage{display:none;width:min(280px,100%);height:auto;margin:15px auto;padding:9px;background:white;border-radius:17px}
+.paircode{font-size:clamp(24px,6vw,34px);font-weight:950;letter-spacing:4px;color:var(--green);margin:14px 0}
+.status{min-height:24px;font-size:13px;color:var(--green)}
+.error{color:#ffb5a8}
+.note{padding:14px;border:1px solid var(--line);border-radius:14px;background:#ffffff06;color:var(--muted);font-size:12px;line-height:1.7}
+.sidecards{display:grid;gap:12px}
+.sidecards .card{padding:18px}
+.sidecards h3{margin:10px 0 5px}
+.sidecards p{font-size:13px}
+.faq{display:grid;gap:10px}
+.faq details{padding:17px 19px;border:1px solid var(--line);border-radius:15px;background:#ffffff08}
+.faq summary{cursor:pointer;color:var(--green);font-weight:800}
+.faq details p{color:var(--muted);line-height:1.7;margin-bottom:0}
+.adminwrap{width:min(1120px,94%);margin:32px auto}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.stat{padding:18px;border:1px solid var(--line);border-radius:16px;background:#ffffff08;color:var(--muted)}
+.stat strong{display:block;font-size:25px;color:var(--green);margin-top:7px}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{text-align:left;padding:12px;border-bottom:1px solid var(--line)}
+th{color:var(--green)}
+@media(max-width:800px){
+  .hero{grid-template-columns:1fr;padding:48px 0}
+  .mascotbox{min-height:270px}
+  .grid{grid-template-columns:repeat(2,1fr)}
+  .portalgrid{grid-template-columns:1fr}
+  .stats{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:540px){
+  .navlinks a:not(.btn){display:none}
+  .grid,.steps{grid-template-columns:1fr}
+  .glass{padding:18px}
+  .portal{margin-top:18px}
+  .hero h1{letter-spacing:-1.5px}
+  .mascotbox{min-height:230px}
+  .section{padding:48px 0}
+  .banner{padding:26px 18px}
+}
+`;
+
+function page(title, body, extra = "") {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#07130f">
+<meta name="description" content="YVONNIE2005 WhatsApp automation and connection portal">
+<title>${title}</title><style>${css}${extra}</style></head><body>${body}</html>`;
+}
+
+function nav() {
+  return `<nav class="nav"><a class="brand" href="/"><span class="brandmark">${robot}</span>YVONNIE2005</a>
+  <div class="navlinks"><a href="/#features">Features</a><a href="/faq">Help & FAQ</a><a href="/admin">Control centre</a><a class="btn" href="/connect">Connect WhatsApp</a></div></nav>`;
+}
+
+/* PUBLIC LANDING PAGE */
+app.get("/", (_req, res) => {
+  const body = `${nav()}<main class="wrap">
+  <header class="hero"><div><span class="eyebrow">✦ WhatsApp automation platform</span>
+  <h1>Make WhatsApp work <span class="gradient">smarter.</span></h1>
+  <p class="lead">Meet YVONNIE2005 — a multi-device WhatsApp assistant built for helpful conversations, group tools and simpler community management.</p>
+  <div class="actions"><a class="btn" href="/connect">Connect your WhatsApp <span>→</span></a><a class="btn alt" href="/faq">Explore the guide</a></div>
+  </div><div class="mascotbox"><span class="floatlabel one">✦ YOUR SMART ASSISTANT</span>${robot}<span class="floatlabel two">YVONNIE2005 BOT</span></div></header>
+  <section class="section" id="features"><div class="sectionhead"><span class="eyebrow">Platform highlights</span><h2>Tools for your WhatsApp world</h2><p>Explore the current bot capabilities. Some advanced features need additional providers or configuration before they can be used.</p></div>
+  <div class="grid">
+  <article class="card"><div class="ico">🤖</div><h3>AI assistant</h3><p>AI-powered question and answer experiences, writing help and everyday assistance when an AI provider is configured.</p></article>
+  <article class="card"><div class="ico">👥</div><h3>Group utilities</h3><p>Group help, rules and supported community tools for smoother conversations.</p></article>
+  <article class="card"><div class="ico">🛡️</div><h3>Moderation</h3><p>Tools for safer group administration and moderation where the bot has the required permissions.</p></article>
+  <article class="card"><div class="ico">⚡</div><h3>QR & pairing</h3><p>Link an authorized WhatsApp account using a QR code or phone-number pairing code.</p></article>
+  <article class="card"><div class="ico">🎧</div><h3>Media commands</h3><p>Media-related commands can be extended with supported external services and providers.</p></article>
+  <article class="card"><div class="ico">📊</div><h3>Admin control</h3><p>A protected control centre for service health and connected worker-account status.</p></article>
+  </div></section>
+  <section class="section"><div class="sectionhead"><span class="eyebrow">Simple setup</span><h2>Connect in three steps</h2><p>Keep your phone nearby and use an account you own or are authorized to manage.</p></div>
+  <div class="steps"><div class="step"><b>01</b><h3>Open connection</h3><p>Choose QR code or phone-number pairing from the secure connection portal.</p></div><div class="step"><b>02</b><h3>Link your device</h3><p>Follow the WhatsApp Linked devices instructions and complete the pairing on your phone.</p></div><div class="step"><b>03</b><h3>You're connected</h3><p>Wait for the portal to confirm the connection, then try the commands currently supported by the bot.</p></div></div></section>
+  <section class="section"><div class="banner"><h2>Ready to meet your assistant?</h2><p>Start with the secure pairing portal. Need help? The guide explains each step.</p><div class="actions" style="justify-content:center"><a class="btn" href="/connect">Open connection portal →</a><a class="btn alt" href="/faq">Read FAQ</a></div></div></section>
+  </main><footer class="footer">© ${new Date().getFullYear()} YVONNIE2005 · Built for smarter WhatsApp communities</footer>`;
+  res.type("html").send(page("YVONNIE2005 | WhatsApp Automation", body));
 });
 
 /* PUBLIC CONNECTION PORTAL */
-
 app.get("/connect", (_req, res) => {
-  res.type("html").send(`<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Connect | YVONNIE2005</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;padding:20px;display:grid;place-items:center;background:radial-gradient(circle at top,#17452e,#07130f 65%);color:#eef8f1;font-family:Arial,sans-serif}
-main{width:min(100%,520px);padding:26px;background:#10251c;border:1px solid #326044;border-radius:22px;box-shadow:0 20px 65px #0009}
-a{color:#b8efc8}h1{color:#b8efc8;margin:0 0 8px}
-p{color:#bfd2c5;line-height:1.55}
-.tabs{display:flex;gap:9px;margin:22px 0}
-button{border:0;border-radius:11px;padding:14px;background:#b8efc8;color:#10251c;font-weight:bold;cursor:pointer}
-button:disabled{opacity:.55}
-.tabs button{flex:1;background:#1d3b2c;color:white}
-.tabs button.active{background:#b8efc8;color:#10251c}
-input{width:100%;padding:15px;border-radius:10px;border:1px solid #456c54;background:#08170f;color:white;margin:10px 0 14px;font-size:16px}
-.panel{display:none}.panel.active{display:block}
-.result{text-align:center;margin-top:17px;overflow-wrap:anywhere}
-#qr{width:250px;height:250px;background:white;padding:8px;border-radius:12px;display:none;margin:15px auto}
-#code{font-size:28px;letter-spacing:3px;font-weight:bold;color:#b8efc8}
-.small{font-size:12px;color:#9eb8a6}.error{color:#ffb4a9}.status{min-height:25px}
-</style></head><body><main>
-<a href="/">← Home</a><h1>Connect WhatsApp</h1>
-<p>Connect an account you own or are authorized to use.</p>
-<div class="tabs"><button id="qrTab" class="active">QR CODE</button><button id="codeTab">PAIRING CODE</button></div>
-<div id="qrPanel" class="panel active">
-<p>Open WhatsApp → Linked devices → Link a device.</p>
-<button id="startQr">Generate QR Code</button>
-<div class="result"><img id="qr" alt="WhatsApp QR code"><p id="qrStatus" class="status"></p></div>
-</div>
-<div id="codePanel" class="panel">
-<p>Enter your WhatsApp number with country code, without spaces.</p>
-<input id="phone" inputmode="numeric" placeholder="2567XXXXXXXX">
-<button id="startCode">Get Pairing Code</button>
-<div class="result"><div id="code"></div><p id="codeStatus" class="status"></p></div>
-</div>
-<p class="small">Sessions expire after 15 minutes if not connected. Never share your QR or pairing code.</p>
-<p id="error" class="error"></p><p><a href="/faq">Need help? Read the pairing guide and FAQ.</a></p>
-</main>
-<script>
-let sessionId=null,sessionToken=null,poller=null,busy=false;
-const el=id=>document.getElementById(id);
-function showTab(tab){
- el("qrPanel").classList.toggle("active",tab==="qr");
- el("codePanel").classList.toggle("active",tab==="code");
- el("qrTab").classList.toggle("active",tab==="qr");
- el("codeTab").classList.toggle("active",tab==="code");
- el("error").textContent="";
-}
-el("qrTab").onclick=()=>showTab("qr");
-el("codeTab").onclick=()=>showTab("code");
-
-async function createSession(){
- const response=await fetch("/public/sessions",{method:"POST"});
- const data=await response.json();
- if(!response.ok)throw new Error(data.error||"Could not start session");
- sessionId=data.id;sessionToken=data.token;
-}
-async function sessionRequest(path,options={}){
- const response=await fetch(path,{
-  ...options,
-  headers:{"Content-Type":"application/json","x-session-token":sessionToken,...(options.headers||{})}
- });
- const data=await response.json();
- if(!response.ok){
-  if(response.status===404||response.status===410){sessionId=null;sessionToken=null;}
-  throw new Error(data.error||"Request failed");
- }
- return data;
-}
-function stopPolling(){if(poller){clearInterval(poller);poller=null;}}
-async function pollQR(){
- try{
-  const data=await sessionRequest("/public/sessions/"+sessionId+"/qr");
-  if(data.qr){
-   el("qr").src=data.qr;el("qr").style.display="block";
-   el("qrStatus").textContent="Scan this code using WhatsApp.";
-  }else if(data.status==="connected"){
-   el("qr").style.display="none";
-   el("qrStatus").textContent="WhatsApp connected successfully!";
-   stopPolling();
-  }else{
-   el("qrStatus").textContent="Waiting for WhatsApp QR code...";
-  }
-  if(data.status==="disconnected"||data.status==="logged_out"){
-   el("qrStatus").textContent=data.error||"Connection ended. Start a new session.";
-   stopPolling();sessionId=null;sessionToken=null;
-  }
- }catch(error){el("qrStatus").textContent=error.message;stopPolling();}
-}
-el("startQr").onclick=async()=>{
- if(busy)return;busy=true;el("startQr").disabled=true;
- el("error").textContent="";el("qr").style.display="none";
- try{
-  stopPolling();sessionId=null;sessionToken=null;
-  await createSession();
-  el("qrStatus").textContent="Waiting for WhatsApp QR code...";
-  await pollQR();
-  if(sessionId)poller=setInterval(pollQR,2500);
- }catch(error){el("error").textContent=error.message;}
- finally{busy=false;el("startQr").disabled=false;}
-};
-el("startCode").onclick=async()=>{
- if(busy)return;busy=true;el("startCode").disabled=true;
- el("error").textContent="";el("code").textContent="";
- try{
-  stopPolling();sessionId=null;sessionToken=null;
-  const phone=el("phone").value.replace(/\\D/g,"");
-  if(phone.length<8||phone.length>15)throw new Error("Enter a valid international phone number.");
-  await createSession();
-  el("codeStatus").textContent="Waiting for WhatsApp to initialize...";
-  const data=await sessionRequest("/public/sessions/"+sessionId+"/pair-code",{
-   method:"POST",body:JSON.stringify({phone})
-  });
-  el("code").textContent=data.pairingCode;
-  el("codeStatus").textContent="WhatsApp → Linked devices → Link with phone number.";
- }catch(error){el("error").textContent=error.message;el("codeStatus").textContent="";}
- finally{busy=false;el("startCode").disabled=false;}
-};
-</script></body></html>`);
+  const body = `${nav()}<main class="portal">
+  <header class="portalhead"><div class="mascotmini">${robot}</div><span class="eyebrow">Secure device linking</span><h1>Connect <span class="gradient">WhatsApp</span></h1><p>Pair an account you own or have permission to manage. Choose your preferred connection method below.</p></header>
+  <div class="portalgrid"><section class="glass">
+  <div class="tabs"><button id="qrTab" class="active" type="button">▦ QR CODE</button><button id="codeTab" type="button">⌁ PAIRING CODE</button></div>
+  <div id="qrPanel" class="panel active"><h2>Scan to connect</h2><p class="muted">Open WhatsApp on your phone, go to Linked devices, choose Link a device, then scan the QR code generated here.</p>
+  <button id="startQr" class="btn" type="button">Generate QR code →</button><div class="result"><img id="qr" class="qrimage" alt="WhatsApp linking QR code"><p id="qrStatus" class="status" aria-live="polite">Your QR code will appear here.</p></div></div>
+  <div id="codePanel" class="panel"><h2>Use your phone number</h2><p class="muted">Enter your full international number, including country code, without spaces or plus signs. Uganda numbers begin with 256.</p>
+  <label for="phone" class="muted">WhatsApp phone number</label><input id="phone" class="field" type="tel" inputmode="numeric" autocomplete="tel" placeholder="2567XXXXXXXX">
+  <button id="startCode" class="btn" type="button">Generate pairing code →</button><div class="result"><div id="code" class="paircode"></div><p id="codeStatus" class="status" aria-live="polite">Your pairing code will appear here.</p></div></div>
+  <p id="error" class="error" role="alert"></p><div class="note">⏱ Pairing sessions expire after 15 minutes if not completed. Never share your QR code or pairing code with anyone. Only link accounts you own or are authorized to manage.</div>
+  </section>
+  <aside class="sidecards"><article class="card"><div class="ico">🔐</div><h3>Private session</h3><p>Each connection attempt receives a temporary session token.</p></article><article class="card"><div class="ico">📱</div><h3>Use WhatsApp settings</h3><p>Open Linked devices on your phone to complete QR or phone-number linking.</p></article><article class="card"><div class="ico">🆘</div><h3>Need a hand?</h3><p>See illustrated steps and troubleshooting answers in the help centre.</p><a href="/faq">Open pairing guide →</a></article></aside></div>
+  <section class="section"><div class="sectionhead"><span class="eyebrow">How it works</span><h2>Pair safely, step by step</h2></div><div class="steps"><div class="step"><b>01</b><h3>Choose a method</h3><p>Generate a fresh QR code or request a phone-number pairing code.</p></div><div class="step"><b>02</b><h3>Confirm on your phone</h3><p>Use WhatsApp's Linked devices menu to approve the connection.</p></div><div class="step"><b>03</b><h3>Wait for confirmation</h3><p>Keep this page open until it reports that the account is connected.</p></div></div></section>
+  <section class="section"><div class="sectionhead"><span class="eyebrow">Quick answers</span><h2>Connection FAQ</h2></div><div class="faq">
+  <details><summary>Where do I find Linked devices?</summary><p>Open WhatsApp on your phone. On Android, tap the three-dot menu and choose Linked devices. On iPhone, open WhatsApp Settings and choose Linked Devices.</p></details>
+  <details><summary>My QR code is not showing. What should I do?</summary><p>Wait a few seconds for the worker to initialize. If no QR appears or the session ends, start a fresh session. Repeated attempts may trigger the temporary rate limit.</p></details>
+  <details><summary>How do I use the pairing code?</summary><p>Choose Pairing Code, enter your international number, then in WhatsApp choose Linked devices and Link with phone number instead. Enter the code displayed here.</p></details>
+  <details><summary>Is it safe to share my code?</summary><p>No. Treat your QR code and pairing code like a password. Only enter them in the official WhatsApp app on your own device.</p></details>
+  <details><summary>How long does a session last?</summary><p>An uncompleted portal session expires after 15 minutes. Start a new session if it expires.</p></details>
+  </div><p style="text-align:center;margin-top:20px"><a href="/faq">View the full help centre and more troubleshooting →</a></p></section>
+  </main><footer class="footer">© ${new Date().getFullYear()} YVONNIE2005 · <a href="/">Home</a> · <a href="/faq">Help centre</a></footer>
+  <script>
+  let sessionId=null,sessionToken=null,poller=null,busy=false;
+  const el=id=>document.getElementById(id);
+  function showTab(tab){el("qrPanel").classList.toggle("active",tab==="qr");el("codePanel").classList.toggle("active",tab==="code");el("qrTab").classList.toggle("active",tab==="qr");el("codeTab").classList.toggle("active",tab==="code");el("error").textContent="";}
+  el("qrTab").onclick=()=>showTab("qr");
+  el("codeTab").onclick=()=>showTab("code");
+  async function createSession(){const r=await fetch("/public/sessions",{method:"POST"});const d=await r.json();if(!r.ok)throw new Error(d.error||"Could not start session.");sessionId=d.id;sessionToken=d.token;}
+  async function sessionRequest(path,options={}){const r=await fetch(path,{...options,headers:{"Content-Type":"application/json","x-session-token":sessionToken,...(options.headers||{})}});const d=await r.json();if(!r.ok){if(r.status===404||r.status===410){sessionId=null;sessionToken=null;}throw new Error(d.error||"Request failed.");}return d;}
+  function stopPolling(){if(poller){clearInterval(poller);poller=null;}}
+  async function pollQR(){if(!sessionId)return;try{const d=await sessionRequest("/public/sessions/"+encodeURIComponent(sessionId)+"/qr");if(d.qr){el("qr").src=d.qr;el("qr").style.display="block";el("qrStatus").textContent="Scan this code using WhatsApp → Linked devices.";}else if(d.status==="connected"){el("qr").style.display="none";el("qrStatus").textContent="✓ WhatsApp connected successfully.";stopPolling();}else{el("qrStatus").textContent="Waiting for WhatsApp QR code…";}if(["disconnected","logged_out"].includes(d.status)){el("qrStatus").textContent=d.error||"Connection ended. Start a new session.";stopPolling();sessionId=null;sessionToken=null;}}catch(e){el("qrStatus").textContent=e.message;stopPolling();}}
+  el("startQr").onclick=async()=>{if(busy)return;busy=true;el("startQr").disabled=true;el("error").textContent="";el("qr").style.display="none";el("qrStatus").textContent="Starting secure session…";try{stopPolling();sessionId=null;sessionToken=null;await createSession();await pollQR();if(sessionId)poller=setInterval(pollQR,2500);}catch(e){el("error").textContent=e.message;}finally{busy=false;el("startQr").disabled=false;}};
+  el("startCode").onclick=async()=>{if(busy)return;busy=true;el("startCode").disabled=true;el("error").textContent="";el("code").textContent="";el("codeStatus").textContent="Preparing your session…";try{stopPolling();sessionId=null;sessionToken=null;const phone=el("phone").value.replace(/\\D/g,"");if(phone.length<8||phone.length>15)throw new Error("Enter a valid international phone number.");await createSession();el("codeStatus").textContent="Waiting for WhatsApp to initialize…";const d=await sessionRequest("/public/sessions/"+encodeURIComponent(sessionId)+"/pair-code",{method:"POST",body:JSON.stringify({phone})});el("code").textContent=d.pairingCode;el("codeStatus").textContent="On your phone: WhatsApp → Linked devices → Link with phone number instead.";}catch(e){el("error").textContent=e.message;el("codeStatus").textContent="";}finally{busy=false;el("startCode").disabled=false;}};
+  </script>`;
+  res.type("html").send(page("Connect WhatsApp | YVONNIE2005", body));
 });
 
-/* FAQ AND PAIRING GUIDE */
-
+/* FULL FAQ PAGE */
 app.get("/faq", (_req, res) => {
-  res.type("html").send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FAQ & Pairing Guide | YVONNIE2005</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#07130f;color:#effff3;font-family:Arial,sans-serif}
-header{padding:28px 7%;background:#10251c;border-bottom:1px solid #28543b}
-a{color:#9af0b5}main{max-width:950px;margin:auto;padding:35px 6%}
-h1,h2{color:#9af0b5}.item{padding:20px;margin:13px 0;background:#10251c;border:1px solid #28543b;border-radius:14px}
-.item h3{margin-top:0}.item p{color:#bdd2c3;line-height:1.7}
-li{color:#bdd2c3;line-height:1.8}
-</style></head><body>
-<header><a href="/">← YVONNIE2005 Home</a><h1>Help Centre & FAQ</h1><p>Connection instructions, pairing help and frequently asked questions.</p></header>
-<main>
-<h2>QR code pairing</h2>
-<div class="item"><h3>Step 1 — Open the connection portal</h3><p>Visit <a href="/connect">the connection page</a> and choose QR CODE.</p></div>
-<div class="item"><h3>Step 2 — Generate your QR code</h3><p>Tap Generate QR Code and wait for the code to appear.</p></div>
-<div class="item"><h3>Step 3 — Open WhatsApp</h3><p>Open WhatsApp → Linked devices → Link a device. Scan the QR code.</p></div>
-<div class="item"><h3>Step 4 — Wait for confirmation</h3><p>Keep the page open while the connection completes. The portal will report when WhatsApp is connected.</p></div>
-<h2>Phone-number pairing</h2>
-<div class="item"><h3>How do I use a pairing code?</h3><ol>
-<li>Open <a href="/connect">the connection portal</a>.</li>
-<li>Select PAIRING CODE.</li><li>Enter your number with country code. Uganda starts with 256.</li>
-<li>Tap Get Pairing Code.</li><li>In WhatsApp, open Linked devices → Link with phone number instead.</li>
-<li>Enter the code displayed on the portal.</li></ol></div>
-<h2>Frequently asked questions</h2>
-<div class="item"><h3>Why is my QR code not appearing?</h3><p>Wait for WhatsApp to initialize. If the session has ended, return to the connection page and start a new one.</p></div>
-<div class="item"><h3>Why does it say WhatsApp session ended?</h3><p>Pairing sessions expire if they are not completed within 15 minutes. Generate a new session.</p></div>
-<div class="item"><h3>What does too many attempts mean?</h3><p>The portal limits repeated connection requests. Wait for the limit window to pass. Avoid repeatedly refreshing or requesting codes.</p></div>
-<div class="item"><h3>My pairing code failed. What should I do?</h3><p>Check the country code and number, update WhatsApp and request a new code only after the previous session has ended.</p></div>
-<div class="item"><h3>Can I connect someone else's WhatsApp?</h3><p>Only connect an account you own or have clear authorization to manage.</p></div>
-<div class="item"><h3>Does the bot need to remain connected?</h3><p>The WhatsApp linked-device session must remain valid. Reconnect if WhatsApp logs it out.</p></div>
-<div class="item"><h3>Where can I find bot commands?</h3><p>Try <b>.help</b> in a group where the bot is active. Some advanced media commands require additional integrations.</p></div>
-<div class="item"><h3>How do I contact the administrator?</h3><p>Use the official contact channel provided by the platform owner. Never share your API token, QR code or pairing code.</p></div>
-<p><a href="/connect">← Return to connection portal</a> · <a href="/">Home</a></p>
-</main></body></html>`);
+  const body = `${nav()}<main class="wrap"><header class="portalhead"><div class="mascotmini">${robot}</div><span class="eyebrow">Help centre</span><h1>Setup guide & <span class="gradient">FAQ</span></h1><p>Follow the steps below to connect your account and solve common pairing problems.</p></header>
+  <section class="section"><div class="sectionhead"><h2>QR code connection</h2><p>Use this method when you can scan a QR code with your phone.</p></div><div class="steps"><div class="step"><b>01</b><h3>Open the portal</h3><p>Go to the <a href="/connect">connection page</a> and select QR Code.</p></div><div class="step"><b>02</b><h3>Generate the code</h3><p>Tap Generate QR Code and wait for the image to appear.</p></div><div class="step"><b>03</b><h3>Scan in WhatsApp</h3><p>Open WhatsApp → Linked devices → Link a device, then scan the displayed code.</p></div></div></section>
+  <section class="section"><div class="sectionhead"><h2>Phone-number pairing</h2><p>Use this if you prefer to enter a short code instead of scanning.</p></div><div class="card"><ol style="color:var(--muted);line-height:2"><li>Open <a href="/connect">the connection portal</a> and select Pairing Code.</li><li>Enter your phone number with country code. For Uganda, begin with 256.</li><li>Tap Generate pairing code.</li><li>On WhatsApp, open Linked devices → Link with phone number instead.</li><li>Enter the code shown on the portal and wait for confirmation.</li></ol></div></section>
+  <section class="section"><div class="sectionhead"><h2>Frequently asked questions</h2><p>Answers to common setup and account questions.</p></div><div class="faq">
+  <details open><summary>Why is my QR code not appearing?</summary><p>The WhatsApp worker may still be initializing. Wait briefly. If the portal reports an error or the session ends, start a new session. If it keeps failing, the hosting logs should be checked.</p></details>
+  <details><summary>Why does the portal say the session expired?</summary><p>Uncompleted sessions expire after 15 minutes. Return to the connection page and generate a new QR or pairing code.</p></details>
+  <details><summary>What does “too many attempts” mean?</summary><p>The portal limits repeated connection requests from the same IP address. Wait for the rate-limit window to pass before trying again.</p></details>
+  <details><summary>My pairing code was rejected. What can I do?</summary><p>Check the country code and phone number, make sure you selected Link with phone number instead in WhatsApp, and create a fresh session before trying again.</p></details>
+  <details><summary>Can I connect another person's WhatsApp?</summary><p>Only connect an account you own or have explicit permission to manage. Never request or use someone else's code without their consent.</p></details>
+  <details><summary>Does my phone need to stay connected?</summary><p>The linked-device session must remain valid. WhatsApp may disconnect linked devices or require you to reconnect.</p></details>
+  <details><summary>Where can I find bot commands?</summary><p>Try <b>.help</b> in a group where the bot is active. Only commands implemented and configured in the running bot will work; some advanced media and AI features need external providers.</p></details>
+  <details><summary>Is the admin dashboard public?</summary><p>The admin API is protected by the API_TOKEN configured in your hosting environment. Never share that token or enter it on unofficial pages.</p></details>
+  <details><summary>What should I do if the bot disconnects?</summary><p>Check the hosting service health and logs. If WhatsApp has logged out the linked device, use the connection portal to link it again.</p></details>
+  <details><summary>Can I share my QR or pairing code?</summary><p>No. Treat them as private authentication credentials. Enter them only in your own WhatsApp application.</p></details>
+  </div></section><section class="section"><div class="banner"><h2>Still need to connect?</h2><p>Return to the secure portal and start a fresh session.</p><a class="btn" href="/connect">Open connection portal →</a></div></section></main><footer class="footer">© ${new Date().getFullYear()} YVONNIE2005 · <a href="/">Home</a></footer>`;
+  res.type("html").send(page("Help Centre & FAQ | YVONNIE2005", body));
 });
 
 /* ADMIN DASHBOARD */
-
 app.get("/admin", (_req, res) => {
-  res.type("html").send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#07130f">
-<title>Admin Control Centre | YVONNIE2005</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#07130f;color:#effff3;font-family:Arial,sans-serif}
-a{color:#9af0b5}header{padding:20px 5%;background:#10251c;border-bottom:1px solid #28543b;display:flex;justify-content:space-between;align-items:center}
-h1,h2,h3{color:#9af0b5}main{max-width:1150px;margin:auto;padding:25px 5%}
-.panel{background:#10251c;border:1px solid #28543b;border-radius:17px;padding:22px;margin-bottom:18px}
-input{width:100%;max-width:500px;padding:14px;border-radius:10px;border:1px solid #456c54;background:#08170f;color:white;margin:8px 0}
-button{padding:12px 17px;border:0;border-radius:10px;background:#9af0b5;color:#092014;font-weight:bold;cursor:pointer}
-button.secondary{background:#244b34;color:white}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:15px}
-.stat{padding:20px;border-radius:14px;background:#0a1b12;border:1px solid #28543b}
-.stat strong{display:block;font-size:26px;color:#9af0b5;margin-top:8px}
-.hidden{display:none}.muted{color:#a9c4b2;line-height:1.6}
-table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px;border-bottom:1px solid #28543b}
-#message{color:#9af0b5;overflow-wrap:anywhere}
-@media(max-width:600px){header{align-items:flex-start;gap:12px;flex-direction:column}.panel{padding:16px}table{font-size:12px}}
-</style></head><body>
-<header><div><h2>YVONNIE2005</h2><span class="muted">ADMIN CONTROL CENTRE</span></div>
-<div><a href="/">Public site</a> · <a href="/connect">Connect</a> · <a href="/faq">FAQ</a></div></header>
-<main>
-<section class="panel" id="login">
-<h1>Administrator sign in</h1>
-<p class="muted">Enter the API_TOKEN configured privately in your hosting environment. It is not stored in the public website.</p>
-<input id="token" type="password" autocomplete="current-password" placeholder="Administrator API token">
-<br><button id="loginBtn">Unlock dashboard</button><p id="loginMessage" class="muted"></p>
-</section>
-<div id="dashboard" class="hidden">
-<section class="panel"><h1>System overview</h1>
-<p class="muted">Live service information from this running worker instance.</p>
-<div class="grid">
-<div class="stat">Service status<strong id="health">Checking...</strong></div>
-<div class="stat">Active worker accounts<strong id="accountsCount">—</strong></div>
-<div class="stat">Pending pairing sessions<strong id="sessionsCount">—</strong></div>
-<div class="stat">Server time<strong id="serverTime">—</strong></div>
-</div></section>
-<section class="panel"><h2>WhatsApp accounts</h2>
-<button id="refresh">Refresh account status</button>
-<div style="overflow-x:auto;margin-top:15px"><table>
-<thead><tr><th>Account ID</th><th>Status</th><th>Last error</th></tr></thead>
-<tbody id="accountRows"><tr><td colspan="3">No account data loaded.</td></tr></tbody>
-</table></div></section>
-<section class="panel"><h2>Connect an existing account ID</h2>
-<p class="muted">Use only an account ID already managed by the system.</p>
-<input id="accountId" placeholder="Account ID"><br>
-<button id="connectAccount">Start account</button><p id="actionMessage"></p>
-</section>
-<section class="panel"><h2>Administrator tools</h2><div class="grid">
-<div class="stat"><h3>Public portal</h3><p class="muted">User-facing connection journey.</p><a href="/connect">Open portal →</a></div>
-<div class="stat"><h3>Help centre</h3><p class="muted">Pairing and troubleshooting guidance.</p><a href="/faq">Open FAQ →</a></div>
-<div class="stat"><h3>Service health</h3><p class="muted">Worker health endpoint.</p><a href="/health">Open health →</a></div>
-</div></section>
-<button class="secondary" id="logout">Lock dashboard</button>
-</div></main>
-<script>
-const el=id=>document.getElementById(id);let token="";
-async function api(path,options={}){
- const response=await fetch(path,{...options,headers:{
-  "Content-Type":"application/json","Authorization":"Bearer "+token,...(options.headers||{})
- }});
- const data=await response.json();
- if(!response.ok)throw new Error(data.error||"Request failed");
- return data;
-}
-async function loadDashboard(){
- const [health,accounts]=await Promise.all([api("/api/health"),api("/api/accounts")]);
- el("health").textContent=health.status||"Unknown";
- el("accountsCount").textContent=health.activeAccounts??0;
- el("sessionsCount").textContent=health.pendingSessions??0;
- el("serverTime").textContent=new Date().toLocaleTimeString();
- const rows=accounts.accounts||[];
- el("accountRows").innerHTML="";
- if(!rows.length){el("accountRows").innerHTML="<tr><td colspan='3'>No active accounts.</td></tr>";return;}
- rows.forEach(a=>{
-  const row=document.createElement("tr");
-  [a.id,a.status,a.error||"—"].forEach(value=>{
-   const cell=document.createElement("td");cell.textContent=value;row.appendChild(cell);
-  });
-  el("accountRows").appendChild(row);
- });
-}
-el("loginBtn").onclick=async()=>{
- token=el("token").value.trim();
- if(!token){el("loginMessage").textContent="Enter your admin token.";return;}
- try{
-  await loadDashboard();el("login").classList.add("hidden");
-  el("dashboard").classList.remove("hidden");el("loginMessage").textContent="";
- }catch(error){token="";el("loginMessage").textContent=error.message;}
-};
-el("refresh").onclick=async()=>{
- try{await loadDashboard();}catch(error){el("actionMessage").textContent=error.message;}
-};
-el("connectAccount").onclick=async()=>{
- const id=el("accountId").value.trim();
- if(!id){el("actionMessage").textContent="Enter an account ID.";return;}
- try{
-  const result=await api("/api/accounts/"+encodeURIComponent(id)+"/connect",{method:"POST"});
-  el("actionMessage").textContent="Account started: "+result.status;
-  await loadDashboard();
- }catch(error){el("actionMessage").textContent=error.message;}
-};
-el("logout").onclick=()=>{
- token="";el("token").value="";
- el("dashboard").classList.add("hidden");el("login").classList.remove("hidden");
-};
-</script></body></html>`);
+  const body = `${nav()}<main class="adminwrap"><header class="portalhead"><span class="eyebrow">Restricted access</span><h1>Admin <span class="gradient">Control Centre</span></h1><p>Private service monitoring for the YVONNIE2005 worker.</p></header>
+  <section class="glass" id="login"><h2>Administrator sign in</h2><p class="muted">Enter the API_TOKEN configured in your hosting environment. It is never saved by this page.</p><input id="token" class="field" type="password" autocomplete="current-password" placeholder="Administrator API token"><button id="loginBtn" class="btn">Unlock dashboard →</button><p id="loginMessage" class="status" role="alert"></p></section>
+  <div id="dashboard" style="display:none"><section class="glass"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap"><h2>System overview</h2><button id="refresh" class="btn alt">↻ Refresh</button></div><div class="stats"><div class="stat">Service status<strong id="health">—</strong></div><div class="stat">Worker accounts<strong id="accountsCount">—</strong></div><div class="stat">Pending sessions<strong id="sessionsCount">—</strong></div><div class="stat">Server time<strong id="serverTime">—</strong></div></div></section>
+  <section class="glass"><h2>WhatsApp accounts</h2><p class="muted">Accounts currently active in this worker process.</p><div class="tablewrap"><table><thead><tr><th>Account ID</th><th>Status</th><th>Last error</th></tr></thead><tbody id="accountRows"><tr><td colspan="3">No data loaded.</td></tr></tbody></table></div></section>
+  <section class="glass"><h2>Start an existing account</h2><p class="muted">Use only an account ID already managed by your system.</p><input id="accountId" class="field" placeholder="Account ID"><button id="connectAccount" class="btn">Start account</button><p id="actionMessage" class="status"></p></section>
+  <section class="grid"><article class="card"><div class="ico">🌐</div><h3>Public portal</h3><p>Open the user-facing connection experience.</p><a href="/connect">Open portal →</a></article><article class="card"><div class="ico">📚</div><h3>Help centre</h3><p>Setup instructions and troubleshooting answers.</p><a href="/faq">Open FAQ →</a></article><article class="card"><div class="ico">💚</div><h3>Health endpoint</h3><p>Check the worker health response.</p><a href="/health">Open health →</a></article></section><p style="margin-top:20px"><button id="logout" class="btn alt">Lock dashboard</button></p></div></main>
+  <script>
+  const el=id=>document.getElementById(id);
+  let token="";
+  async function api(path,options={}){const r=await fetch(path,{...options,headers:{"Content-Type":"application/json","Authorization":"Bearer "+token,...(options.headers||{})}});const d=await r.json();if(!r.ok)throw new Error(d.error||"Request failed.");return d;}
+  async function loadDashboard(){const [h,a]=await Promise.all([api("/api/health"),api("/api/accounts")]);el("health").textContent=h.status||"Unknown";el("accountsCount").textContent=h.activeAccounts??0;el("sessionsCount").textContent=h.pendingSessions??0;el("serverTime").textContent=new Date().toLocaleTimeString();const rows=a.accounts||[];el("accountRows").replaceChildren();if(!rows.length){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=3;td.textContent="No active accounts.";tr.appendChild(td);el("accountRows").appendChild(tr);return;}rows.forEach(a=>{const tr=document.createElement("tr");[a.id,a.status,a.error||"—"].forEach(v=>{const td=document.createElement("td");td.textContent=String(v);tr.appendChild(td);});el("accountRows").appendChild(tr);});}
+  el("loginBtn").onclick=async()=>{token=el("token").value.trim();if(!token){el("loginMessage").textContent="Enter your admin token.";return;}try{await loadDashboard();el("login").style.display="none";el("dashboard").style.display="block";}catch(e){token="";el("loginMessage").textContent=e.message;}};
+  el("refresh").onclick=async()=>{try{await loadDashboard();el("actionMessage").textContent="Updated.";}catch(e){el("actionMessage").textContent=e.message;}};
+  el("connectAccount").onclick=async()=>{const id=el("accountId").value.trim();if(!id){el("actionMessage").textContent="Enter an account ID.";return;}try{const d=await api("/api/accounts/"+encodeURIComponent(id)+"/connect",{method:"POST"});el("actionMessage").textContent="Account started: "+d.status;await loadDashboard();}catch(e){el("actionMessage").textContent=e.message;}};
+  el("logout").onclick=()=>{token="";el("token").value="";el("dashboard").style.display="none";el("login").style.display="block";};
+  </script>`;
+  res.type("html").send(page("Admin Control Centre | YVONNIE2005", body));
 });
 
 /* HEALTH */
-
 app.get("/health", (_req, res) => {
   res.json({
     status: "healthy",
@@ -650,97 +463,58 @@ app.get("/health", (_req, res) => {
 });
 
 /* PUBLIC SESSION CREATION */
-
 app.post("/public/sessions", rateLimit, async (_req, res) => {
   try {
-    const session = await createPublicSession();
-    res.status(201).json(session);
+    res.status(201).json(await createPublicSession());
   } catch (error) {
     console.error("Session creation failed:", error.message);
-    res.status(503).json({
-      error: error.message || "Could not start WhatsApp session."
-    });
+    res.status(503).json({ error: error.message || "Could not start WhatsApp session." });
   }
 });
 
 /* PUBLIC QR STATUS */
-
 app.get("/public/sessions/:id/qr", sessionAuth, async (req, res) => {
   const account = accounts.get(req.params.id);
-
-  if (!account) {
-    return res.status(410).json({ error: "WhatsApp session ended. Start again." });
-  }
-
-  if (account.status === "connected") {
-    return res.json({ status: "connected", qr: null });
-  }
-
-  if (account.status === "disconnected" || account.status === "logged_out") {
+  if (!account) return res.status(410).json({ error: "WhatsApp session ended. Start again." });
+  if (account.status === "connected") return res.json({ status: "connected", qr: null });
+  if (["disconnected", "logged_out"].includes(account.status)) {
     return res.json({ status: account.status, qr: null, error: account.lastError });
   }
-
-  if (!account.qr) {
-    return res.json({ status: account.status, qr: null });
-  }
-
+  if (!account.qr) return res.json({ status: account.status, qr: null });
   try {
-    const qr = await QRCode.toDataURL(account.qr, { width: 280, margin: 1 });
+    const qr = await QRCode.toDataURL(account.qr, { width: 300, margin: 1 });
     res.json({ status: account.status, qr });
-  } catch (error) {
+  } catch (_) {
     res.status(500).json({ error: "QR generation failed." });
   }
 });
 
 /* PUBLIC PAIRING CODE */
-
 app.post("/public/sessions/:id/pair-code", sessionAuth, async (req, res) => {
   const account = accounts.get(req.params.id);
   const phone = String(req.body.phone || "").replace(/\D/g, "");
-
-  if (!account?.socket) {
-    return res.status(410).json({ error: "WhatsApp session ended. Start again." });
-  }
-
-  if (phone.length < 8 || phone.length > 15) {
-    return res.status(400).json({ error: "Invalid international phone number." });
-  }
-
-  if (account.status === "connected") {
-    return res.status(409).json({ error: "This WhatsApp account is already connected." });
-  }
-
-  if (account.status === "disconnected" || account.status === "logged_out") {
+  if (!account?.socket) return res.status(410).json({ error: "WhatsApp session ended. Start again." });
+  if (phone.length < 8 || phone.length > 15) return res.status(400).json({ error: "Invalid international phone number." });
+  if (account.status === "connected") return res.status(409).json({ error: "This WhatsApp account is already connected." });
+  if (["disconnected", "logged_out"].includes(account.status)) {
     return res.status(410).json({ error: account.lastError || "WhatsApp session ended. Start again." });
   }
-
   try {
     await waitForSocketReady(account);
-
-    if (account.status === "connected") {
-      return res.status(409).json({ error: "This WhatsApp account is already connected." });
-    }
-
-    if (!account.pairingPromise) {
-      account.pairingPromise = account.socket.requestPairingCode(phone);
-    }
-
+    if (account.status === "connected") return res.status(409).json({ error: "This WhatsApp account is already connected." });
+    if (!account.pairingPromise) account.pairingPromise = account.socket.requestPairingCode(phone);
     const pairingCode = await account.pairingPromise;
     account.pairingCode = pairingCode;
-
     res.json({ success: true, pairingCode, status: account.status });
   } catch (error) {
     account.pairingPromise = null;
     account.pairingCode = null;
     console.error("Pairing code error:", error.message);
-    res.status(503).json({
-      error: error.message || "Pairing code is not ready. Start a fresh session and try again."
-    });
+    res.status(503).json({ error: error.message || "Pairing code is not ready. Start a fresh session and try again." });
   }
 });
 
 /* PROTECTED ADMIN API */
-
 app.use("/api", apiAuth);
 
 app.get("/api/health", (_req, res) => {
@@ -754,7 +528,6 @@ app.get("/api/health", (_req, res) => {
 app.post("/api/accounts/:id/connect", async (req, res) => {
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g, "");
   if (!id) return res.status(400).json({ error: "Invalid account ID." });
-
   try {
     const account = await startAccount(id);
     res.json({ success: true, account: id, status: account.status });
@@ -766,33 +539,18 @@ app.post("/api/accounts/:id/connect", async (req, res) => {
 app.get("/api/accounts/:id/qr", (req, res) => {
   const account = accounts.get(req.params.id);
   if (!account) return res.status(404).json({ error: "Account not started." });
-
-  res.json({
-    status: account.status,
-    qr: account.qr,
-    error: account.lastError
-  });
+  res.json({ status: account.status, qr: account.qr, error: account.lastError });
 });
 
 app.post("/api/accounts/:id/pair-code", async (req, res) => {
   const account = accounts.get(req.params.id);
   const phone = String(req.body.phone || "").replace(/\D/g, "");
-
-  if (!account?.socket) {
-    return res.status(404).json({ error: "Connect account first." });
-  }
-  if (phone.length < 8 || phone.length > 15) {
-    return res.status(400).json({ error: "Invalid phone number." });
-  }
-  if (account.status === "connected") {
-    return res.status(409).json({ error: "This account is already connected." });
-  }
-
+  if (!account?.socket) return res.status(404).json({ error: "Connect account first." });
+  if (phone.length < 8 || phone.length > 15) return res.status(400).json({ error: "Invalid phone number." });
+  if (account.status === "connected") return res.status(409).json({ error: "This account is already connected." });
   try {
     await waitForSocketReady(account);
-    if (!account.pairingPromise) {
-      account.pairingPromise = account.socket.requestPairingCode(phone);
-    }
+    if (!account.pairingPromise) account.pairingPromise = account.socket.requestPairingCode(phone);
     const pairingCode = await account.pairingPromise;
     account.pairingCode = pairingCode;
     res.json({ success: true, pairingCode });
@@ -814,63 +572,34 @@ app.get("/api/accounts", (_req, res) => {
 });
 
 /* DATABASE AND SERVER STARTUP */
-
 async function start() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("DATABASE_URL is missing.");
-  }
-  if (!TOKEN) {
-    throw new Error("API_TOKEN is missing.");
-  }
+  if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is missing.");
+  if (!TOKEN) throw new Error("API_TOKEN is missing.");
 
   await initializeDatabase();
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_auth_keys (
-      account_id TEXT NOT NULL,
-      key_type TEXT,
-      key_id TEXT NOT NULL,
-      key_data JSONB
-    )
-  `);
+  await query(`CREATE TABLE IF NOT EXISTS whatsapp_auth_keys (
+    account_id TEXT NOT NULL,
+    key_type TEXT,
+    key_id TEXT NOT NULL,
+    key_data JSONB
+  )`);
 
-  await query(`
-    ALTER TABLE whatsapp_auth_keys
-    ADD COLUMN IF NOT EXISTS key_type TEXT
-  `);
+  await query(`ALTER TABLE whatsapp_auth_keys ADD COLUMN IF NOT EXISTS key_type TEXT`);
+  await query(`UPDATE whatsapp_auth_keys SET key_type = 'legacy' WHERE key_type IS NULL`);
+  await query(`ALTER TABLE whatsapp_auth_keys ALTER COLUMN key_type SET NOT NULL`);
 
-  await query(`
-    UPDATE whatsapp_auth_keys
-    SET key_type = 'legacy'
-    WHERE key_type IS NULL
-  `);
-
-  await query(`
-    ALTER TABLE whatsapp_auth_keys
-    ALTER COLUMN key_type SET NOT NULL
-  `);
-
-  await query(`
-    DO $$
+  await query(`DO $$
     DECLARE pk_name TEXT;
     BEGIN
-      SELECT conname INTO pk_name
-      FROM pg_constraint
-      WHERE conrelid = 'whatsapp_auth_keys'::regclass
-        AND contype = 'p';
-
+      SELECT conname INTO pk_name FROM pg_constraint
+      WHERE conrelid = 'whatsapp_auth_keys'::regclass AND contype = 'p';
       IF pk_name IS NOT NULL THEN
-        EXECUTE format(
-          'ALTER TABLE whatsapp_auth_keys DROP CONSTRAINT %I',
-          pk_name
-        );
+        EXECUTE format('ALTER TABLE whatsapp_auth_keys DROP CONSTRAINT %I', pk_name);
       END IF;
-
-      ALTER TABLE whatsapp_auth_keys
-      ADD CONSTRAINT whatsapp_auth_keys_pkey
+      ALTER TABLE whatsapp_auth_keys ADD CONSTRAINT whatsapp_auth_keys_pkey
       PRIMARY KEY (account_id, key_type, key_id);
-    END $$;
-  `);
+    END $$`);
 
   app.listen(PORT, () => {
     console.log("YVONNIE2005 running on port " + PORT);
