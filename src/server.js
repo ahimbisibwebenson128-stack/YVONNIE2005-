@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -124,7 +125,10 @@ async function startAccount(id) {
         account.lastError = "Could not save WhatsApp credentials.";
       }
     });
-    attachGroupHandlers(socket);
+
+    // IMPORTANT: Pass the account ID to the Group AI handler.
+    attachGroupHandlers(socket, id);
+
     socket.ev.on("connection.update", update => {
       if (update.qr) {
         account.qr = update.qr;
